@@ -291,6 +291,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self.model = model
         self.formatting_func = formatting_func
 
         # Auto resize images to save VRAM!
@@ -456,23 +457,59 @@ class UnslothVisionDataCollator:
             return_tensors = "pt",
             add_special_tokens = False, # Stop double BOS
         )
+        
+        if "pixel_values" in batch and "input_ids" in batch:
+            input_ids = batch["input_ids"]
+            pixel_values = batch["pixel_values"]
+
+            # Basic check: pixel_values should be a tensor and have a batch dimension
+            if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim >= 2:
+                batch_size = input_ids.shape[0]
+                num_pixel_value_entries = pixel_values.shape[0]
+
+                if batch_size == num_pixel_value_entries:
+                    image_token_id = getattr(self.model.config, "image_token_index", None)
+
+                    if image_token_id is None:
+                       try: image_token_id = self.processor.tokenizer.convert_tokens_to_ids("<image>")
+                       except: image_token_id = 262144 
+
+                    if image_token_id is not None:
+                        image_token_counts = (input_ids == image_token_id).sum(dim=1)
+                        sequences_with_images_mask = (image_token_counts > 0)
+                        num_sequences_with_images = sequences_with_images_mask.sum().item()
+
+                        if num_sequences_with_images != num_pixel_value_entries:
+                            if num_sequences_with_images > 0:
+                                new_pixel_values = pixel_values[sequences_with_images_mask]
+                                print(f"Unsloth Collator Fix: Adjusting pixel_values. "
+                                      f"Sequences with image tokens: {num_sequences_with_images}. "
+                                      f"Pixel value entries: {num_pixel_value_entries} -> {new_pixel_values.shape[0]}.")
+                                batch["pixel_values"] = new_pixel_values
+                            elif num_pixel_value_entries > 0 :
+                                print(f"Unsloth Collator Fix: Removing all pixel_values. "
+                                      f"Sequences with image tokens: 0. "
+                                      f"Pixel value entries: {num_pixel_value_entries} -> 0.")
+                                del batch["pixel_values"]
+
         # Cannot remove due to bidirectional attention from Gemma 3!
         # batch.pop("token_type_ids", None)
 
         # Pixtral accepts multiple images, so we have to cast it individually
-        pixel_values = batch["pixel_values"]
-        if type(pixel_values) is list:
-            for j, pixel_value_j in enumerate(pixel_values):
-                if type(pixel_value_j) is list:
-                    for k, pixel_value_k in enumerate(pixel_value_j):
-                        pixel_value_j[k] = pixel_value_k.to(self.dtype)
-                else:
-                    pixel_values[j] = pixel_value_j.to(self.dtype)
+        if "pixel_values" in batch:
+            pixel_values = batch["pixel_values"]
+            if type(pixel_values) is list:
+                for j, pixel_value_j in enumerate(pixel_values):
+                    if type(pixel_value_j) is list:
+                        for k, pixel_value_k in enumerate(pixel_value_j):
+                            pixel_value_j[k] = pixel_value_k.to(self.dtype)
+                    else:
+                        pixel_values[j] = pixel_value_j.to(self.dtype)
+                pass
+                batch["pixel_values"] = pixel_values
+            else:
+                batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
             pass
-            batch["pixel_values"] = pixel_values
-        else:
-            batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
-        pass
 
         # Mask image tokens and pad tokens
         labels = batch["input_ids"].clone()
